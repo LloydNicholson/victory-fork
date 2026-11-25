@@ -2507,6 +2507,24 @@ mod group_sim {
 
     static GROUPS: Mutex<Option<HashMap<usize, Group>>> = Mutex::new(None);
 
+    /// The highest value the title has signalled each fence to (signals
+    /// issued, run or not): a wait for no more than that is met by the host
+    /// queue's order, all queues' work going to the card through one queue.
+    static ISSUED: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+    /// Whether groups span the title's queues (`VICTORY_GROUP_SIM_QUEUES=1`:
+    /// per queue): the host sends every queue's work through one queue, in
+    /// the order the title makes it.
+    fn global() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_SIM_QUEUES").is_none_or(|v| v != "1"))
+    }
+
+    /// The group key of `queue`.
+    fn key(queue: usize) -> usize {
+        if global() { 0 } else { queue }
+    }
+
     /// Since the last frame line: submissions, groups ended, refreshed
     /// pages counted per submission, the same per group, and the groups
     /// ended by each cause (a read of what a member writes, a member's
@@ -2581,7 +2599,7 @@ mod group_sim {
         STATS[PAGES_ALONE].fetch_add(refreshed.len() as u64, Ordering::Relaxed);
         let mut all = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
         let groups = all.get_or_insert_with(HashMap::new);
-        let group = groups.entry(queue).or_default();
+        let group = groups.entry(key(queue)).or_default();
         let why = if group.members == 0 {
             None
         } else if waits {
@@ -2604,15 +2622,24 @@ mod group_sim {
         group.closed |= runs_work;
     }
 
-    /// A signal on `queue`: set behind the group, which goes on.
-    pub(crate) fn signal() {
+    /// A signal of `fence` to `value`: set behind the group, which goes on.
+    pub(crate) fn signal(fence: usize, value: u64) {
         STATS[SIGNALS].fetch_add(1, Ordering::Relaxed);
+        let mut issued = ISSUED.lock().unwrap_or_else(|e| e.into_inner());
+        let v = issued.get_or_insert_with(HashMap::new).entry(fence).or_default();
+        *v = (*v).max(value);
     }
 
-    /// A wait on `queue` for a fence already at its value: nothing to wait
-    /// for, the group goes on.
-    pub(crate) fn met_wait() {
-        STATS[MET_WAITS].fetch_add(1, Ordering::Relaxed);
+    /// A wait on `queue` for `fence` to reach `value` (`completed`: where it
+    /// stands): met, or met by order behind a signal already issued, the
+    /// group goes on; otherwise it ends.
+    pub(crate) fn wait(queue: usize, fence: usize, value: u64, completed: u64) {
+        let issued = ISSUED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&fence).copied()).unwrap_or(0);
+        if completed >= value || issued >= value {
+            STATS[MET_WAITS].fetch_add(1, Ordering::Relaxed);
+        } else {
+            cut(Some(queue));
+        }
     }
 
     /// An unmet wait on `queue` (`None`: a present, every queue): the
@@ -2621,7 +2648,7 @@ mod group_sim {
         let mut all = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(groups) = all.as_mut() else { return };
         let ended: Vec<Group> = match queue {
-            Some(q) => groups.remove(&q).into_iter().collect(),
+            Some(q) => groups.remove(&key(q)).into_iter().collect(),
             None => groups.drain().map(|(_, g)| g).collect(),
         };
         drop(all);
@@ -2633,7 +2660,7 @@ mod group_sim {
     /// The groups' members on `queue` now (tests).
     #[cfg(test)]
     fn members(queue: usize) -> u32 {
-        GROUPS.lock().unwrap().as_ref().and_then(|g| g.get(&queue)).map_or(0, |g| g.members)
+        GROUPS.lock().unwrap().as_ref().and_then(|g| g.get(&key(queue))).map_or(0, |g| g.members)
     }
 
     #[cfg(test)]
@@ -2679,11 +2706,12 @@ mod group_sim {
         let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64).collect();
         let mb = |pages: f64| pages * crate::watch::PAGE as f64 / 1e6 / frames;
         format!(
-            "grouping, simulated (cap {}): {:.1} submissions a frame in {:.1} groups ended ({:.1} each); \
+            "grouping, simulated (cap {}, {}): {:.1} submissions a frame in {:.1} groups ended ({:.1} each); \
              refreshed {:.1} MB a frame counted per submission, {:.1} MB per group; groups ended by a read \
              of what a member writes {:.1}, a member's work on title memory {:.1}, the cap {:.1}, an unmet \
-             wait or a present {:.1}; passed inside groups: {:.1} signals, {:.1} waits already met",
+             wait or a present {:.1}; passed inside groups: {:.1} signals, {:.1} waits met or met by order",
             cap(),
+            if global() { "across queues" } else { "per queue" },
             s[SUBMISSIONS] / frames,
             s[ENDED] / frames,
             if s[ENDED] > 0.0 { s[SUBMISSIONS] / s[ENDED] } else { 0.0 },
@@ -2700,7 +2728,7 @@ mod group_sim {
 }
 #[cfg(feature = "diagnostics")]
 pub(crate) use group_sim::{
-    cut as group_cut, line as group_line, met_wait as group_met_wait, probe as group_probe, signal as group_signal,
+    cut as group_cut, line as group_line, probe as group_probe, signal as group_signal, wait as group_wait,
 };
 
 /// What a fill of upload memory is for ([`Step::Fill`]): a root constant
