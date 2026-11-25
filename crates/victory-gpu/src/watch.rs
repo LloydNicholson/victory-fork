@@ -243,6 +243,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    new_submission();
     ask_once_end();
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -766,8 +767,75 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
+/// Submissions begun ([`ask_once`]): the age of [`UNCOMMITTED`]'s answers.
+static SUBMISSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A submission begins: regions found uncommitted are asked about again.
+fn new_submission() {
+    SUBMISSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Regions [`uncommitted_end`] found uncommitted, by first block: (end,
+/// the submission that asked).
+static UNCOMMITTED: Mutex<std::collections::BTreeMap<usize, (usize, u64)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// `VirtualQuery` calls of [`uncommitted_end`] since the last frame line,
+/// their microseconds, and the answers taken from [`UNCOMMITTED`] instead.
+#[cfg(feature = "diagnostics")]
+pub(crate) static UNCOMMITTED_ASKED: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether a region found uncommitted stays so for the rest of the
+/// submission (`VICTORY_ABSENT_ONCE=0`: asked every time, as before).
+///
+/// The guards ask the kernel, block by block, whether the uncommitted blocks
+/// of a copy they refresh are committed yet: under Proton `VirtualQuery`
+/// walks the process's memory map under its one lock, and in the world the
+/// title's submitting thread was caught there in the middle of its
+/// submission, the card idle behind it. Memory a submission reads was
+/// written, so committed, before the title submitted it (the same reasoning
+/// as [`once`]); what the runtime maps meanwhile drops the answers
+/// ([`title_memory_remapped`]).
+fn absent_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Only with a count of submissions to age the answers by.
+    *ON.get_or_init(|| once() && std::env::var_os("VICTORY_ABSENT_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = SUBMISSION.load(Relaxed);
+    if absent_once() {
+        let known = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, &(end, asked))) = known.range(..=block).next_back()
+            && asked == now
+            && block < end
+        {
+            #[cfg(feature = "diagnostics")]
+            UNCOMMITTED_ASKED[2].fetch_add(1, Relaxed);
+            return end;
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let end = uncommitted_end_asked(block);
+    #[cfg(feature = "diagnostics")]
+    {
+        UNCOMMITTED_ASKED[0].fetch_add(1, Relaxed);
+        UNCOMMITTED_ASKED[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    }
+    if absent_once() && end > block {
+        let mut known = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        known.retain(|_, &mut (_, asked)| asked == now);
+        known.insert(block, (end, now));
+    }
+    end
+}
+
+/// [`uncommitted_end`], from the kernel.
+fn uncommitted_end_asked(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -986,6 +1054,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // What was found uncommitted may be committed now.
+    UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1236,7 +1306,43 @@ mod tests {
             // SAFETY: each address is inside its committed read-write page.
             unsafe { (at as *mut u8).write_volatile(1) };
         }
+        // The title submits what it wrote: a new submission asks again
+        // (within one, the answer that the block is uncommitted is kept).
+        new_submission();
         assert_eq!(refresh(), [early / PAGE, late / PAGE]);
+    }
+
+    /// Within one submission a region found uncommitted is not asked about
+    /// again; the next submission asks, and so does a runtime remap.
+    #[test]
+    fn an_uncommitted_region_is_asked_about_once_a_submission() {
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(reserved, 0);
+        let first = reserved.div_ceil(BLOCK);
+        new_submission();
+        let end = uncommitted_end(first);
+        assert!(end > first);
+        // Committed behind the memo's back: still uncommitted in this
+        // submission.
+        // SAFETY: our reservation.
+        let at = unsafe { VirtualAlloc((first * BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_eq!(at, first * BLOCK);
+        if absent_once() {
+            assert_eq!(uncommitted_end(first), end);
+        }
+        // The next submission sees it committed.
+        new_submission();
+        assert_eq!(uncommitted_end(first), first);
+        // A remap drops what was kept.
+        new_submission();
+        let next = uncommitted_end(first + 1);
+        assert!(next > first + 1);
+        // SAFETY: our reservation.
+        unsafe { VirtualAlloc(((first + 1) * BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+        title_memory_remapped((first + 1) * BLOCK, BLOCK);
+        assert_eq!(uncommitted_end(first + 1), first + 1);
+        // SAFETY: our reservation, released whole.
+        unsafe { VirtualFree(reserved as _, 0, MEM_RELEASE) };
     }
 
     /// A range of view memory whose first block is not mapped is a view
