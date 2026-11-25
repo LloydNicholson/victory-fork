@@ -746,6 +746,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-shader-hot"
+version = "0.1.0"
+dependencies = [
+ "victory-shader",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

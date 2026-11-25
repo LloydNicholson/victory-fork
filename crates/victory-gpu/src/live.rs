@@ -64,6 +64,11 @@ pub(crate) fn number(name: &str) -> Option<u64> {
     with(name, |v| v.parse().ok())
 }
 
+/// A live text switch, as the file gives it (trimmed).
+pub(crate) fn text(name: &str) -> Option<String> {
+    with(name, |v| Some(v.to_owned()))
+}
+
 /// A live on/off switch (`1`/`0`, `on`/`off`, `true`/`false`).
 pub(crate) fn flag(name: &str) -> Option<bool> {
     with(name, parse_flag)

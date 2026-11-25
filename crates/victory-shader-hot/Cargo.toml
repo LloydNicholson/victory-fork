@@ -1,0 +1,21 @@
+[package]
+name = "victory-shader-hot"
+description = "The shader translator as a DLL the running game loads again after each change (VICTORY_SHADER_HOT)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+victory-shader.workspace = true
+
+[features]
+# As the game's build: its diagnostics build translates with victory-shader's diagnostics on.
+diagnostics = ["victory-shader/diagnostics"]
+
+[lints]
+workspace = true

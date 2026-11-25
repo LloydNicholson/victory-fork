@@ -180,15 +180,22 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
+    let host = crate::shader_cache::host_shader(container)?;
+    with_host(container, host)
+}
+
+/// The translation around `host`: the console resources the container's
+/// code reads, and whether it stores.
+#[cfg(windows)]
+fn with_host(container: &[u8], host: victory_shader::emit::HostShader) -> Result<Translated, String> {
+    use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
@@ -591,6 +598,8 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
+    hot::register(&host);
+    #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
@@ -789,6 +798,15 @@ pub(crate) fn frame_log_counts() -> (u64, u64) {
 }
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod hot;
+
+/// The host's widest wave, as the device said (the hot-swap translator is
+/// told it too).
+#[cfg(windows)]
+pub(crate) fn note_host_wave(lanes: u32) {
+    hot::HOST_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

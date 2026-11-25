@@ -25,7 +25,7 @@ use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
-    shaders: Vec<Arc<Shader>>,
+    pub(super) shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
@@ -38,6 +38,10 @@ pub(crate) struct Pending {
     /// is making it ([`stuck`]).
     begun_us: AtomicU64,
     replaced: AtomicBool,
+    /// A host pipeline made from shaders translated again by the hot-swap
+    /// translator (`super::hot`), used in place of `made` while set. Never
+    /// freed: a list recorded with it may still be in flight.
+    pub(super) hot: std::sync::atomic::AtomicPtr<HostPipeline>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -63,6 +67,7 @@ impl Pending {
             used: AtomicBool::new(false),
             begun_us: AtomicU64::new(0),
             replaced: AtomicBool::new(false),
+            hot: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -196,11 +201,21 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
+    let hot = p.hot.load(Ordering::Acquire);
+    if !hot.is_null() {
+        // SAFETY: hot pipelines are leaked, never freed.
+        return Some(unsafe { &*hot });
+    }
     if p.made.get().is_none() {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a draw or dispatch has asked for it (`super::hot` remakes those only).
+pub(super) fn used(p: &Pending) -> bool {
+    p.used.load(Ordering::Relaxed)
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
