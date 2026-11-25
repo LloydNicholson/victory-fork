@@ -55,11 +55,13 @@ pub(crate) fn listed(n: u64) -> bool {
 /// The frames a trigger file or the live marker (F12, `crate::live`) asked for.
 static TRIGGER: Trigger = Trigger::new();
 
-/// The live marker: the next two frames saved like a trigger file's. Says
-/// which, or `None` without a capture folder.
+/// The live marker: the frame being recorded now and the one after saved
+/// like a trigger file's (the soonest the game can show; at a few frames a
+/// second even that is seconds after the key, so `marker-shot.sh` also takes
+/// a screenshot at once). Says which, or `None` without a capture folder.
 pub(crate) fn request() -> Option<String> {
     let folder = folder()?;
-    let from = crate::queue::presented() + 2;
+    let from = crate::queue::presented() + 1;
     TRIGGER.from.store(from, std::sync::atomic::Ordering::Relaxed);
     Some(format!("frames {from} and {} in {}", from + 1, folder.display()))
 }
