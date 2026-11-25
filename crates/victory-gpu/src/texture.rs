@@ -367,9 +367,12 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+///
+/// Live (`crate::live`): `TEXTURE_NO_WAIT=0/1` changes it mid-run.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    let usual = *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"));
+    crate::live::flag("TEXTURE_NO_WAIT").unwrap_or(usual)
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
