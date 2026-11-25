@@ -2566,9 +2566,12 @@ mod group_sim {
         STATS[why].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The submission `runs` is made on queue `queue`; `waits`: one of its
-    /// lists waits for a memory value (it starts a group of its own).
-    pub(crate) fn probe(queue: usize, runs: &[&HostList], waits: bool) {
+    /// The submission `runs` is made on queue `queue`; `waits`: the memory
+    /// values its lists wait for that are not there now. One that no value
+    /// written so far (a signal, a submitted list's bottom-of-pipe write)
+    /// meets starts a group of its own; one met by such a write is met by
+    /// the host queue's order.
+    pub(crate) fn probe(queue: usize, runs: &[&HostList], waits: &[crate::list::ValueWait]) {
         let page = crate::watch::PAGE;
         let mut reads: Vec<(usize, usize)> = Vec::new();
         let mut written: Vec<(usize, usize)> = Vec::new();
@@ -2596,7 +2599,14 @@ mod group_sim {
                 }
             }
         }
-        join(queue, &reads, written, refreshed, runs_work, waits);
+        let unmet = waits.iter().any(|w| {
+            let issued = ISSUED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&w.address()).copied());
+            !issued.is_some_and(|v| w.holds_for(v))
+        });
+        if !waits.is_empty() && !unmet {
+            STATS[MET_WAITS].fetch_add(waits.len() as u64, Ordering::Relaxed);
+        }
+        join(queue, &reads, written, refreshed, runs_work, unmet);
     }
 
     /// [`probe`] once the submission's steps are read: `reads` (title memory

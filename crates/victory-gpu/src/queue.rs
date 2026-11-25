@@ -526,8 +526,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         #[cfg(feature = "diagnostics")]
         if !this.is_null() {
             let runs: Vec<&crate::host::HostList> = lists.iter().filter_map(|&l| crate::list::host_list(l)).collect();
-            let waits = lists.iter().any(|&l| crate::list::cut_list(l));
-            crate::host::group_probe(this as usize, &runs, waits);
+            let waits = crate::list::unmet_waits(lists);
+            crate::host::group_probe(this as usize, &runs, &waits);
         }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);

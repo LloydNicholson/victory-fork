@@ -1826,6 +1826,12 @@ impl ValueWait {
 
     /// Whether the wait is met with `value` at its address (its low half
     /// for a 32-bit wait).
+    /// The address waited on (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn address(&self) -> usize {
+        self.address as usize
+    }
+
     pub(crate) fn holds_for(&self, value: u64) -> bool {
         let (value, reference) = if self.wide {
             (value, self.reference)
