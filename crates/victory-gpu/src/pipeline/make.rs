@@ -74,7 +74,9 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        // Its shaders: a worker that died making it (a stack overflow) leaves
+        // it here for good, and the frame line names it.
+        None => Some(format!("being made {:?}", p.shaders)),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
