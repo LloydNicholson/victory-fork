@@ -2511,7 +2511,7 @@ mod group_sim {
     /// pages counted per submission, the same per group, and the groups
     /// ended by each cause (a read of what a member writes, a member's
     /// work on title memory, the cap, a signal or wait or present).
-    pub(super) static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    pub(super) static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
     const SUBMISSIONS: usize = 0;
     const ENDED: usize = 1;
     const PAGES_ALONE: usize = 2;
@@ -2520,6 +2520,10 @@ mod group_sim {
     const BY_RUN: usize = 5;
     const BY_CAP: usize = 6;
     const BY_QUEUE: usize = 7;
+    /// Signals and met waits passed inside groups (they do not end one: a
+    /// signal is set when the whole group has run, later, never earlier).
+    const SIGNALS: usize = 8;
+    const MET_WAITS: usize = 9;
 
     /// The most submissions a group takes (`VICTORY_GROUP_SIM_CAP`, 8).
     fn cap() -> u32 {
@@ -2600,7 +2604,18 @@ mod group_sim {
         group.closed |= runs_work;
     }
 
-    /// A signal or a wait on `queue` (`None`: a present, every queue): the
+    /// A signal on `queue`: set behind the group, which goes on.
+    pub(crate) fn signal() {
+        STATS[SIGNALS].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A wait on `queue` for a fence already at its value: nothing to wait
+    /// for, the group goes on.
+    pub(crate) fn met_wait() {
+        STATS[MET_WAITS].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An unmet wait on `queue` (`None`: a present, every queue): the
     /// groups there end.
     pub(crate) fn cut(queue: Option<usize>) {
         let mut all = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2666,8 +2681,8 @@ mod group_sim {
         format!(
             "grouping, simulated (cap {}): {:.1} submissions a frame in {:.1} groups ended ({:.1} each); \
              refreshed {:.1} MB a frame counted per submission, {:.1} MB per group; groups ended by a read \
-             of what a member writes {:.1}, a member's work on title memory {:.1}, the cap {:.1}, a signal, \
-             wait or present {:.1}",
+             of what a member writes {:.1}, a member's work on title memory {:.1}, the cap {:.1}, an unmet \
+             wait or a present {:.1}; passed inside groups: {:.1} signals, {:.1} waits already met",
             cap(),
             s[SUBMISSIONS] / frames,
             s[ENDED] / frames,
@@ -2678,11 +2693,15 @@ mod group_sim {
             s[BY_RUN] / frames,
             s[BY_CAP] / frames,
             s[BY_QUEUE] / frames,
+            s[SIGNALS] / frames,
+            s[MET_WAITS] / frames,
         )
     }
 }
 #[cfg(feature = "diagnostics")]
-pub(crate) use group_sim::{cut as group_cut, line as group_line, probe as group_probe};
+pub(crate) use group_sim::{
+    cut as group_cut, line as group_line, met_wait as group_met_wait, probe as group_probe, signal as group_signal,
+};
 
 /// What a fill of upload memory is for ([`Step::Fill`]): a root constant
 /// view whose copy is not 256-byte aligned, a constant view in a
