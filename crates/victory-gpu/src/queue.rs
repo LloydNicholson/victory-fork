@@ -623,7 +623,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    crate::host::group_signal(fence as usize, value);
+    crate::host::group_signal(crate::fence::value_address(fence), value);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -650,7 +650,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    crate::host::group_wait(this as usize, fence as usize, value, crate::fence::completed(fence));
+    crate::host::group_wait(this as usize, crate::fence::value_address(fence), value, crate::fence::completed(fence));
     #[cfg(windows)]
     if !this.is_null() {
         let now = crate::fence::completed(fence);

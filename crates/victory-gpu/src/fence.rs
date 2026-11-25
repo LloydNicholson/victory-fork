@@ -133,6 +133,13 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
 extern "system" fn creation_flags(this: This) -> u32 {
     fence(this).flags
 }
+/// The address of `this` fence's value (diagnostics: a list's
+/// bottom-of-pipe write there advances it as a signal would).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn value_address(this: This) -> usize {
+    (&raw const fence(this).value) as usize
+}
+
 /// Where the value lives (GPU addresses are CPU addresses).
 extern "system" fn gpu_address(this: This) -> u64 {
     (&raw const fence(this).value) as u64

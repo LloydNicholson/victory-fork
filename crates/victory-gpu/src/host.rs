@@ -2507,9 +2507,11 @@ mod group_sim {
 
     static GROUPS: Mutex<Option<HashMap<usize, Group>>> = Mutex::new(None);
 
-    /// The highest value the title has signalled each fence to (signals
-    /// issued, run or not): a wait for no more than that is met by the host
-    /// queue's order, all queues' work going to the card through one queue.
+    /// The highest value the title has had written to each fence (by the
+    /// address of its value): signals issued and lists' bottom-of-pipe
+    /// writes submitted, run or not. A wait for no more than that is met by
+    /// the host queue's order, all queues' work going to the card through
+    /// one queue.
     static ISSUED: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
     /// Whether groups span the title's queues (`VICTORY_GROUP_SIM_QUEUES=1`:
@@ -2573,6 +2575,13 @@ mod group_sim {
         let mut refreshed: BTreeSet<usize> = BTreeSet::new();
         let mut runs_work = false;
         for list in runs {
+            let deferred = list.deferred();
+            for (at, what, _) in &deferred.writes {
+                if let crate::queue::Written::Value(v) = what {
+                    issue(*at, *v);
+                }
+            }
+            drop(deferred);
             for step in &list.deferred().copies {
                 match step {
                     &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => reads.push((src, src + len)),
@@ -2622,12 +2631,18 @@ mod group_sim {
         group.closed |= runs_work;
     }
 
-    /// A signal of `fence` to `value`: set behind the group, which goes on.
-    pub(crate) fn signal(fence: usize, value: u64) {
-        STATS[SIGNALS].fetch_add(1, Ordering::Relaxed);
+    /// `value` is to be written at `at` (a fence's value, say).
+    fn issue(at: usize, value: u64) {
         let mut issued = ISSUED.lock().unwrap_or_else(|e| e.into_inner());
-        let v = issued.get_or_insert_with(HashMap::new).entry(fence).or_default();
+        let v = issued.get_or_insert_with(HashMap::new).entry(at).or_default();
         *v = (*v).max(value);
+    }
+
+    /// A signal of the fence whose value lives at `at` to `value`: set
+    /// behind the group, which goes on.
+    pub(crate) fn signal(at: usize, value: u64) {
+        STATS[SIGNALS].fetch_add(1, Ordering::Relaxed);
+        issue(at, value);
     }
 
     /// A wait on `queue` for `fence` to reach `value` (`completed`: where it
