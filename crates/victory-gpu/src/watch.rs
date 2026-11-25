@@ -57,6 +57,53 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// The page ranges `[first, last)` the kernel was asked about since the
+/// last frame line ([`asked_pages`]): how many of the pages asked are
+/// asked again within the same frames (each submission refreshes the
+/// copies it uses, and many share them).
+#[cfg(feature = "diagnostics")]
+static ASKED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+fn note_asked(first: usize, last: usize) {
+    ASKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((first, last));
+}
+
+/// Pages the kernel was asked about since the last call, and how many
+/// distinct pages they were.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn asked_pages() -> (u64, u64) {
+    let ranges = std::mem::take(&mut *ASKED.lock().unwrap_or_else(|e| e.into_inner()));
+    let total = ranges
+        .iter()
+        .map(|&(a, b)| b.saturating_sub(a) as u64)
+        .sum();
+    (total, distinct(ranges))
+}
+
+/// Pages covered by the ranges `[first, last)`, each page once.
+#[cfg(any(test, feature = "diagnostics"))]
+fn distinct(mut ranges: Vec<(usize, usize)>) -> u64 {
+    ranges.retain(|r| r.0 < r.1);
+    ranges.sort_unstable();
+    let mut pages = 0u64;
+    let mut open: Option<(usize, usize)> = None;
+    for (a, b) in ranges {
+        match &mut open {
+            Some((_, end)) if a <= *end => *end = (*end).max(b),
+            _ => {
+                if let Some((s, e)) = open.replace((a, b)) {
+                    pages += (e - s) as u64;
+                }
+            }
+        }
+    }
+    pages + open.map_or(0, |(s, e)| (e - s) as u64)
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -252,6 +299,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    note_asked(first, last);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -321,6 +370,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    note_asked(first, last);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -719,6 +770,24 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn distinct_pages_count_each_page_once() {
+        assert_eq!(distinct(Vec::new()), 0);
+        // Overlapping, touching, nested and repeated ranges, out of order.
+        let ranges = vec![
+            (10, 20),
+            (0, 5),
+            (15, 25),
+            (5, 6),
+            (12, 13),
+            (10, 20),
+            (30, 31),
+        ];
+        assert_eq!(distinct(ranges), 6 + 15 + 1);
+        // Empty ranges count nothing.
+        assert_eq!(distinct(vec![(4, 4), (9, 8)]), 0);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

@@ -12,9 +12,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
@@ -474,6 +474,87 @@ struct Call {
     identity: usize,
     done: Mutex<bool>,
     finished: Condvar,
+    /// The last `XAsyncSchedule` of this call that its queue refused (0:
+    /// none). A provider that ignores the refusal leaves the call pending
+    /// for good: its work never runs ([`stuck`] reports it).
+    refused: AtomicI32,
+}
+
+/// A wait in `XAsyncGetStatus` longer than this is reported ([`stuck`]),
+/// and again every [`STUCK_AGAIN`] while it lasts. The wait itself goes on.
+#[cfg(not(test))]
+const STUCK_AFTER: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STUCK_AFTER: Duration = Duration::from_millis(50);
+const STUCK_AGAIN: Duration = Duration::from_secs(60);
+
+/// Reports of waits longer than [`STUCK_AFTER`], since the start.
+static STUCK_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// What is known of a call that has not completed: enough to find the
+/// title's provider (an address in the title's image, whose base the
+/// loader's "image mapped" line gives) and why its work may not run.
+#[derive(Debug)]
+struct Stuck {
+    block: usize,
+    status: HRESULT,
+    provider: usize,
+    identity: usize,
+    context: usize,
+    queue: usize,
+    /// The queue's work and completion port modes; `None` if the handle no
+    /// longer resolves (the process queue cleared).
+    ports: Option<[Mode; 2]>,
+    terminated: bool,
+    refused: Option<HRESULT>,
+}
+
+impl std::fmt::Display for Stuck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "XAsync call not completed: block {:#x}, status {:#x}, provider {:#x}, identity {:#x}, \
+             context {:#x}; queue {:#x}",
+            self.block, self.status, self.provider, self.identity, self.context, self.queue
+        )?;
+        match self.ports {
+            Some([work, completion]) => write!(f, " (work {work:?}, completion {completion:?}")?,
+            None => write!(f, " (no longer a queue")?,
+        }
+        if self.terminated {
+            write!(f, ", terminated")?;
+        }
+        write!(f, ")")?;
+        if let Some(hr) = self.refused {
+            write!(
+                f,
+                "; a schedule of its work was refused with {hr:#x}, so the work never ran"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// [`Stuck`] for the call on `block`, if one is in flight.
+fn stuck(block: *mut AsyncBlock) -> Option<Stuck> {
+    let call = call(block)?;
+    // SAFETY: a block in flight is valid.
+    let handle = unsafe { (*block).queue };
+    let queue = queue(handle);
+    let refused = call.refused.load(Ordering::Acquire);
+    Some(Stuck {
+        block: block as usize,
+        status: status(block),
+        provider: call.provider as usize,
+        identity: call.identity,
+        context: call.context,
+        queue: handle as usize,
+        ports: queue.as_ref().map(|q| [q.ports[0].mode, q.ports[1].mode]),
+        terminated: queue
+            .as_ref()
+            .is_some_and(|q| q.terminated.load(Ordering::Acquire)),
+        refused: (refused != 0).then_some(refused),
+    })
 }
 
 impl Call {
@@ -544,6 +625,7 @@ pub fn XAsyncBegin(
         identity: identity as usize,
         done: Mutex::new(false),
         finished: Condvar::new(),
+        refused: AtomicI32::new(0),
     });
     lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
@@ -568,15 +650,22 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
             XAsyncComplete(block, hr, 0);
         }
     }
-    if block.is_null() || call(block).is_none() {
+    if block.is_null() {
         return E_INVALIDARG;
     }
+    let Some(call) = call(block) else {
+        return E_INVALIDARG;
+    };
     // SAFETY: a block in flight is valid.
     let handle = unsafe { (*block).queue };
-    match queue(handle) {
+    let hr = match queue(handle) {
         Some(queue) => queue.submit(WORK, delay_ms, Task::new(block.cast(), work)),
         None => E_INVALIDARG,
+    };
+    if hr < 0 {
+        call.refused.store(hr, Ordering::Release);
     }
+    hr
 }
 
 /// Records the result (the first one wins), wakes waiters and queues the
@@ -624,8 +713,33 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
         return E_INVALIDARG;
     }
     if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+        // Waited in slices so that a wait that does not end is reported
+        // (`stuck`): a title thread blocked here for minutes otherwise shows
+        // only as the title's own watchdog firing.
+        let started = Instant::now();
+        let mut report_at = STUCK_AFTER;
+        let mut done = lock(&call.done);
+        while !*done {
+            let left = report_at.saturating_sub(started.elapsed());
+            done = call
+                .finished
+                .wait_timeout(done, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            if !*done && started.elapsed() >= report_at {
+                // Not under the lock: completing takes it.
+                drop(done);
+                if let Some(s) = stuck(block) {
+                    STUCK_REPORTS.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        waited_s = started.elapsed().as_secs(),
+                        "XAsyncGetStatus still waiting: {s}"
+                    );
+                }
+                report_at += STUCK_AGAIN;
+                done = lock(&call.done);
+            }
+        }
     }
     status(block)
 }
@@ -1331,6 +1445,125 @@ mod tests {
         assert_eq!(
             XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)),
             E_ABORT
+        );
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A provider whose call stays pending until the test completes it.
+    extern "system" fn never(_: u32, _: *const ProviderData) -> HRESULT {
+        S_OK
+    }
+
+    #[test]
+    fn a_pending_call_is_described_with_its_provider_and_queue() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 1, &mut q), S_OK);
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let identity = 0x5e as *const c_void;
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                7 as *mut c_void,
+                identity,
+                std::ptr::null(),
+                Some(never)
+            ),
+            S_OK
+        );
+        let s = stuck(&mut block).expect("a call in flight");
+        assert_eq!(s.provider, never as *const () as usize);
+        assert_eq!((s.identity, s.context), (0x5e, 7));
+        assert_eq!(s.ports, Some([Mode::Manual, Mode::ThreadPool]));
+        assert!(!s.terminated);
+        assert_eq!(s.refused, None);
+        assert_eq!(s.status, E_PENDING);
+        let text = s.to_string();
+        assert!(
+            text.contains("work Manual") && text.contains("completion ThreadPool"),
+            "{text}"
+        );
+        XAsyncComplete(&mut block, E_ABORT, 0);
+        assert!(stuck(&mut block).is_none(), "the call ended");
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn a_schedule_the_queue_refused_is_noted_on_the_call() {
+        // A provider that schedules its work and ignores the answer: on a
+        // terminated queue the work never runs and the call stays pending.
+        extern "system" fn schedules(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_BEGIN {
+                // SAFETY: the runtime passes valid provider data.
+                let _ = XAsyncSchedule(unsafe { (*data).block }, 0);
+            }
+            S_OK
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        assert_eq!(
+            XTaskQueueTerminate(q, true, std::ptr::null_mut(), None),
+            S_OK
+        );
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(schedules)
+            ),
+            S_OK
+        );
+        let s = stuck(&mut block).expect("still pending");
+        assert!(s.terminated);
+        assert_eq!(s.refused, Some(E_ABORT));
+        assert!(s.to_string().contains("refused"), "{s}");
+        XAsyncComplete(&mut block, E_ABORT, 0);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn a_long_wait_is_reported_and_still_returns_on_completion() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(never)
+            ),
+            S_OK
+        );
+        let before = STUCK_REPORTS.load(Ordering::SeqCst);
+        let at = &raw mut block as usize;
+        let completer = std::thread::spawn(move || {
+            std::thread::sleep(STUCK_AFTER * 4);
+            XAsyncComplete(at as *mut AsyncBlock, S_OK, 0);
+        });
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        completer.join().unwrap();
+        assert!(
+            STUCK_REPORTS.load(Ordering::SeqCst) > before,
+            "the wait was reported"
         );
         XTaskQueueCloseHandle(q);
     }

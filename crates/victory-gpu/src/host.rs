@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -421,8 +421,13 @@ fn card_clock_watch(clock: &'static CardClock) {
         };
         // SAFETY: the clock's fence and this thread's event.
         unsafe {
-            if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+            // The clock only counts: with the device gone it stops, and
+            // whoever waits for the work reports the loss.
+            if clock.fence.SetEventOnCompletion(target, event).is_ok()
+                && let Some(host) = host()
+                && !wait_card(&host.device, event)
+            {
+                return;
             }
         }
         seen = target;
@@ -506,6 +511,103 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// How long a wait for the card goes before it asks whether the device is
+/// gone ([`wait_card`]).
+#[cfg(not(test))]
+const CARD_WAIT_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const CARD_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Waits for `event`, which a fence of `device` sets (`SetEventOnCompletion`),
+/// in slices of [`CARD_WAIT_SLICE`], asking between them whether the device
+/// is gone. True once the event is set; false if the device was removed.
+///
+/// A wait without end hid every lost device on Linux: there the host's
+/// D3D12 sets no fence event once the card has faulted, so the thread that
+/// lands flights waited for good, nothing reported the loss (with its
+/// command trail), and the title, its frames stopped, crashed itself on its
+/// own GPU timeout a minute later (runs bc-1, 6 and 9 of 2026-11-25).
+fn wait_card(device: &ID3D12Device, event: HANDLE) -> bool {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    let slice = CARD_WAIT_SLICE.as_millis() as u32;
+    loop {
+        // SAFETY: an event of the caller's.
+        if unsafe { WaitForSingleObject(event, slice) } == WAIT_OBJECT_0 {
+            return true;
+        }
+        // SAFETY: a plain query.
+        if unsafe { device.GetDeviceRemovedReason() }.is_err() {
+            return false;
+        }
+    }
+}
+
+/// Lists [`SentNotes`] keeps, and commands it keeps of each.
+#[cfg(feature = "diagnostics")]
+const SENT_KEPT: usize = 12;
+#[cfg(feature = "diagnostics")]
+const SENT_COMMANDS: usize = 8;
+
+/// The last lists sent to the card and the last commands noted in each
+/// (diagnostics, with `VICTORY_D3D12_DRED`), for the device-loss report
+/// whichever thread finds the device gone: the thread that lands flights
+/// has taken them off the line by then, and the copy-back of the card's
+/// copies (where a loss was found in run bd-1) never held them.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct SentNotes(std::collections::VecDeque<(u64, usize, Vec<String>)>);
+
+#[cfg(feature = "diagnostics")]
+impl SentNotes {
+    fn push(&mut self, submission: u64, notes: &[String]) {
+        let last = notes[notes.len().saturating_sub(SENT_COMMANDS)..].to_vec();
+        self.0.push_back((submission, notes.len(), last));
+        while self.0.len() > SENT_KEPT {
+            self.0.pop_front();
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut text = String::new();
+        for (submission, all, last) in &self.0 {
+            text.push_str(&format!(
+                "\n  submission {submission}, a list of {all} commands, its last: {}",
+                last.join(" | ")
+            ));
+        }
+        text
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static SENT: Mutex<Option<SentNotes>> = Mutex::new(None);
+
+/// Keeps the notes of `runs`, about to be sent as `submission` ([`SentNotes`]).
+#[cfg(feature = "diagnostics")]
+fn remember_sent(submission: u64, runs: &[&HostList]) {
+    if !dred_on() {
+        return;
+    }
+    let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
+    let sent = sent.get_or_insert_with(SentNotes::default);
+    for run in runs {
+        let notes: Vec<String> = run
+            .notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        sent.push(submission, &notes);
+    }
+}
+
+/// The error a wait for the card gives when [`wait_card`] found the device
+/// gone.
+fn card_gone() -> windows::core::Error {
+    windows::core::Error::from(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED)
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -516,6 +618,17 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
             log_removal_context();
+            #[cfg(feature = "diagnostics")]
+            if let Ok(sent) = SENT.try_lock()
+                && let Some(sent) = sent.as_ref()
+            {
+                tracing::error!("the last lists sent to the card before it was lost:{}", sent.text());
+            }
+            // The host's own report of a lost device (vkd3d-proton's
+            // breadcrumbs, `VKD3D_CONFIG=breadcrumbs`) comes from its own
+            // thread once it notices: a run that ends at once cuts it off.
+            #[cfg(all(feature = "diagnostics", not(test)))]
+            std::thread::sleep(std::time::Duration::from_secs(3));
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
@@ -737,6 +850,55 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn sent_notes_keep_the_last_lists_and_their_last_commands() {
+        let mut ring = SentNotes::default();
+        for n in 0..SENT_KEPT as u64 + 3 {
+            let notes: Vec<String> = (0..SENT_COMMANDS + 2).map(|c| format!("s{n} c{c}")).collect();
+            ring.push(n, &notes);
+        }
+        let text = ring.text();
+        assert!(!text.contains("submission 2,"), "the oldest lists are dropped: {text}");
+        assert!(text.contains(&format!("submission {},", SENT_KEPT + 2)), "{text}");
+        let last = SENT_KEPT + 2;
+        assert!(text.contains(&format!("s{last} c{}", SENT_COMMANDS + 1)), "the newest command is kept");
+        assert!(!text.contains(&format!("s{last} c1 ")), "only the last commands of a list: {text}");
+    }
+
+    #[test]
+    fn a_card_wait_ends_when_the_fence_is_set_after_several_slices() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device and object creation on the default adapter.
+        let made = unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) };
+        let Some(device) = made.ok().and(device) else {
+            eprintln!("no D3D12 device: skipped");
+            return;
+        };
+        // SAFETY: as above.
+        let (fence, event) = unsafe {
+            (
+                device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).unwrap(),
+                CreateEventW(None, false, false, None).unwrap(),
+            )
+        };
+        // SAFETY: our fence and event.
+        unsafe { fence.SetEventOnCompletion(1, event).unwrap() };
+        let setter = {
+            let fence = fence.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(CARD_WAIT_SLICE * 2 + CARD_WAIT_SLICE / 2);
+                // SAFETY: our fence.
+                unsafe { fence.Signal(1).unwrap() };
+            })
+        };
+        let started = std::time::Instant::now();
+        assert!(wait_card(&device, event), "the device is alive: the wait ends when the fence is set");
+        assert!(started.elapsed() >= CARD_WAIT_SLICE * 2, "it waited across slices");
+        setter.join().unwrap();
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -2308,8 +2470,10 @@ fn late_helper() {
         // thread prepares and sends meanwhile.
         // SAFETY: our fence and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+            if host.fence.SetEventOnCompletion(target, event).is_ok() && !wait_card(&host.device, event) {
+                fail(format_args!(
+                    "host GPU device removed while waiting for submissions sent ahead (VICTORY_LATE_WAIT)"
+                ));
             }
         }
         {
@@ -2446,11 +2610,11 @@ fn relay_worker() {
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
+                let waited = unsafe { host.fence.SetEventOnCompletion(target, event) }.map(|()| {
+                    if !wait_card(&host.device, event) {
+                        host.relay_lost();
+                    }
+                });
                 if waited.is_err() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -3427,7 +3591,9 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                if !wait_card(&self.device, event) {
+                    return Err(card_gone());
+                }
                 Ok(after)
             })()
         };
@@ -3467,6 +3633,28 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
+    /// The thread that lands flights found the device gone while it waited
+    /// for the card ([`wait_card`]): ends the run with the last things done
+    /// in every list still in the air, as a landing that finds it gone does.
+    fn relay_lost(&self) -> ! {
+        let line = line();
+        let runs: Vec<&HostList> = line
+            .line
+            .iter()
+            .filter_map(|l| match l {
+                Late::Run(flight) => Some(flight),
+                _ => None,
+            })
+            .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
+            .collect();
+        fail(format_args!(
+            "host GPU device removed while the relay waited for the card (VICTORY_RELAY=1), {} lists in the air{}{}",
+            runs.len(),
+            self.removal_data(&runs),
+            last_notes(&runs)
+        ));
+    }
+
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
         {
@@ -3645,7 +3833,9 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    if !wait_card(&self.device, self.event) {
+                        return Err(card_gone());
+                    }
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -3864,7 +4054,9 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
-                            WaitForSingleObject(self.event, INFINITE);
+                            // A gone device ends the wait; the check below
+                            // reports it.
+                            wait_card(&self.device, self.event);
                             stood(waiting);
                             working(true);
                         }
@@ -4091,6 +4283,8 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        #[cfg(feature = "diagnostics")]
+        remember_sent(this_submission, runs);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -4146,7 +4340,9 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
-                        WaitForSingleObject(self.event, INFINITE);
+                        // A gone device ends the wait; the check below
+                        // reports it.
+                        wait_card(&self.device, self.event);
                         stood(started);
                         working(true);
                     }

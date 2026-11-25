@@ -2082,9 +2082,12 @@ impl<'a> Lower<'a> {
         };
         if !every {
             if halves {
+                // (two host waves would exchange through LDS behind a
+                // barrier, which lanes that do not run here never reach)
                 need(self.cur_ir);
+                return Err(WHERE);
             }
-            return Err(WHERE);
+            return Ok(self.half_sum_running(x));
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -2110,6 +2113,67 @@ impl<'a> Lower<'a> {
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
         Ok(self.s.m.bin(c, Bin::Or, first, total))
+    }
+
+    /// [`Self::half_sum`] in one host wave of 64 lanes where not every lane
+    /// runs, still bit for bit as the console adds it. The console's section
+    /// turns every lane on (`s_or_saveexec_b64 -1`) and gives the lanes that
+    /// were off a term of +0 (`v_cndmask` on the saved mask), so its tree
+    /// runs over all 64 lanes; on the host those lanes do not run, and their
+    /// partial sums cannot be read. Each step of the tree adds the partial
+    /// sum of the partner's aligned run of lanes: every running lane of a run
+    /// holds that run's sum, so it is read from the run's first running lane
+    /// (the wave's ballot), and a run with none running sums to +0, as the
+    /// console's +0 terms add up to. The high half is lane 0's term where
+    /// lane 0 runs, and 0 where it does not (`v_cndmask` gave it a whole 0).
+    fn half_sum_running(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let yes = self.s.m.bool(true);
+        let running = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+        let (lo, hi) = (self.s.m.extract(c, running, 0), self.s.m.extract(c, running, 1));
+        let (zero, k31, k32) = (self.s.m.i32(0), self.s.m.i32(31), self.s.m.i32(32));
+        let mut sum = x;
+        for step in 0..6u32 {
+            let c = self.cur;
+            let size = 1u32 << step;
+            let bit = self.s.m.i32(size);
+            let partner = self.s.m.bin(c, Bin::Xor, lane, bit);
+            let align = self.s.m.i32(!(size - 1));
+            let start = self.s.m.bin(c, Bin::And, partner, align);
+            // the half of the ballot that holds the run, its lanes at bit 0
+            let upper = self.s.m.bin(c, Bin::And, start, k32);
+            let upper = self.s.m.cmp(c, pred::NE, upper, zero);
+            let word = self.s.m.select(c, upper, hi, lo);
+            let shift = self.s.m.bin(c, Bin::And, start, k31);
+            let mut run = self.s.m.bin(c, Bin::LShr, word, shift);
+            if size < 32 {
+                let mask = self.s.m.i32((1u32 << size) - 1);
+                run = self.s.m.bin(c, Bin::And, run, mask);
+            }
+            let any = self.s.m.cmp(c, pred::NE, run, zero);
+            // FirstbitLo (dx.op 32): the run's first running lane
+            let first = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[run]);
+            let from = self.s.m.bin(c, Bin::Add, start, first);
+            // (with none running this lane reads itself; the value is not used)
+            let from = self.s.m.select(c, any, from, lane);
+            let theirs = self.read_lane(sum, from);
+            let theirs = self.s.m.select(c, any, theirs, zero);
+            sum = self.add_halves(sum, theirs);
+        }
+        let c = self.cur;
+        let (high, low, one) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(1));
+        // where lane 0 runs it is the wave's first running lane
+        let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        let first = self.s.m.bin(c, Bin::And, first, high);
+        let zero_runs = self.s.m.bin(c, Bin::And, lo, one);
+        let zero_runs = self.s.m.cmp(c, pred::NE, zero_runs, zero);
+        let first = self.s.m.select(c, zero_runs, first, zero);
+        let sum = self.s.m.bin(c, Bin::And, sum, low);
+        self.s.m.bin(c, Bin::Or, first, sum)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -5438,16 +5502,24 @@ impl<'a> Lower<'a> {
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // The host's table of strides by heap slot tells a buffer view (a
+        // stride), a constant buffer (`SLOT_CONSTANT_BUFFER`) and anything
+        // else (0) apart; only the load that fits the slot runs, and a slot
+        // that is neither reads zeros, as the console's hardware gives for
+        // a descriptor with no buffer behind it. (Read as a constant buffer,
+        // a texture's or an empty slot faulted the card at address 0 on the
+        // host's D3D12 on Linux: fork issue #698, item 4.)
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let constant = self.s.m.i32(super::shader::SLOT_CONSTANT_BUFFER);
+            let c = self.cur;
+            let some = self.s.m.cmp(c, pred::NE, stride, zero);
+            let not_cb = self.s.m.cmp(c, pred::NE, stride, constant);
+            let is_buffer = self.s.m.bin(c, Bin::And, some, not_cb);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -5470,7 +5542,7 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let other = self.s.m.cmp(self.cur, pred::EQ, stride, constant);
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -11458,6 +11530,113 @@ mod tests {
             perm_features(256) & 0x8000,
             0,
             "dynamic v_perm_b32 must not require INT64"
+        );
+    }
+
+    /// A compute program of `threads` in a wave64 build, lowered for a host
+    /// whose waves reach 64 lanes (AMD), with 512 bytes of LDS.
+    fn lower_wave64_host(words: &[u32], threads: [u32; 3]) -> Result<Lowered, crate::ShaderError> {
+        super::TEST_HOST_WAVE.set(Some(64));
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        let r = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        super::TEST_HOST_WAVE.set(None);
+        r
+    }
+
+    /// The console's `WaveActiveSum` of 16-bit floats (the tree of
+    /// `wave::tests::a_sum_of_halves_over_the_wave_is_followed_in_the_order_of_its_tree`)
+    /// inside a branch only lanes 0-31 take, in one host wave of 64: the
+    /// section turns every lane on (`s_or_saveexec_b64 -1`) and gives the
+    /// lanes outside the branch +0 (`v_cndmask`), which the host, whose
+    /// lanes outside the branch do not run, takes as +0 too. Refused before
+    /// ("where not every lane runs"): compute `b22a16a178976e1b` of the
+    /// title, dropped 28-42 times a frame in the world on AMD.
+    #[test]
+    fn a_wave_sum_of_halves_where_not_every_lane_runs_lowers_on_64_lane_hosts() {
+        let words = [
+            0x7D88_00A0, // v_cmp_gt_u32_e32 vcc, 32, v0
+            0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+            0xBF88_0014, // s_cbranch_execz 20 (past the section)
+            0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+            0xD501_0001,
+            0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+            0x6402_02E9,
+            0xDE54_C101, // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+            0x6402_02E9,
+            0x9360_1201, // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+            0x6402_02E9,
+            0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+            0x6402_02FA,
+            0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+            0xD778_0002,
+            0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+            0x6402_0302, // v_add_f16 v1, v2, v1
+            0xD760_0007,
+            0x0001_4101, // v_readlane_b32 s7, v1, 32
+            0x6402_0207, // v_add_f16 v1, s7, v1
+            0xD760_0007,
+            0x0001_0101, // v_readlane_b32 s7, v1, 0
+            0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+            0x7E06_0207, // v_mov_b32 v3, s7
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        lower_wave64_host(&words, [64, 1, 1]).unwrap();
+    }
+
+    /// A scalar buffer load through a descriptor the program picks from the
+    /// view heap at an index it computes (heap base at s0, byte offset from a
+    /// root constant at s1): no used-resource entry, so the host's strides
+    /// table says what the slot holds and the load reads it as raw bytes, as
+    /// a constant buffer or as zeros.
+    #[test]
+    fn a_scalar_load_through_a_heap_picked_descriptor_lowers() {
+        let words = [
+            0x8F02_8501, // s_lshl_b32 s2, s1, 5 (slot index * 32 bytes)
+            0x8004_0200, // s_add_u32 s4, s0, s2
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 1, 1)];
+        let lowered = lower_with(&words, layout, Vec::new()).unwrap();
+        assert!(
+            lowered.root_srvs.contains(&super::super::shader::SLOT_STRIDES),
+            "it reads the host's strides table"
         );
     }
 

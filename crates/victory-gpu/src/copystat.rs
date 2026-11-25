@@ -1094,6 +1094,22 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    {
+        // How much of what the kernel is asked about each frame is asked
+        // again (the same copies refreshed by several submissions).
+        let (asked, distinct) = crate::watch::asked_pages();
+        let bytes = |pages: u64| pages as f64 * crate::watch::PAGE as f64 / frames / 1e6;
+        tracing::info!(
+            "write-watch askings per frame: {:.1} MB asked, {:.1} MB of it distinct ({:.1}x)",
+            bytes(asked),
+            bytes(distinct),
+            if distinct > 0 {
+                asked as f64 / distinct as f64
+            } else {
+                0.0
+            },
+        );
+    }
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
