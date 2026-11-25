@@ -500,10 +500,11 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
 /// waited for that flight to land: fps-21 settled twice a frame for such
 /// fills, part of 47 ms a frame of the submit thread standing. Read from the
 /// copy, the bytes come in queue order on the card. `VICTORY_TABLE_CBV_FILL=1`
-/// fills them all, as before.
+/// fills them all, as before (live: `TABLE_CBV_FILL=1` in `crate::live`'s file).
 fn constant_in_copy(list: &HostList, address: u64, size: u32) -> Option<u64> {
     static FILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *FILL.get_or_init(|| std::env::var_os("VICTORY_TABLE_CBV_FILL").is_some_and(|v| v == "1")) {
+    let usual = *FILL.get_or_init(|| std::env::var_os("VICTORY_TABLE_CBV_FILL").is_some_and(|v| v == "1"));
+    if crate::live::flag("TABLE_CBV_FILL").unwrap_or(usual) {
         return None;
     }
     let rounded = u64::from(size).next_multiple_of(256);

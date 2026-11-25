@@ -2727,15 +2727,18 @@ mod join_tests {
 /// (`VICTORY_SUBMIT_GROUP`, 1 by default: none grouped). With submissions
 /// sent ahead (`late`) only. fps-17 measured groups of about 4.5 that
 /// would refresh half the memory of the submissions apart.
+///
+/// Live (`crate::live`): `SUBMIT_GROUP=n` in the file changes it mid-run.
 pub(crate) fn group_cap() -> usize {
     static CAP: OnceLock<usize> = OnceLock::new();
-    *CAP.get_or_init(|| {
+    let usual = *CAP.get_or_init(|| {
         let cap = std::env::var("VICTORY_SUBMIT_GROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
         if cap > 1 {
             tracing::info!(cap, "consecutive title submissions of a queue are prepared and sent as one (VICTORY_SUBMIT_GROUP)");
         }
         cap
-    })
+    });
+    crate::live::number("SUBMIT_GROUP").map_or(usual, |n| (n as usize).max(1))
 }
 
 /// Title submissions sent, and host submissions they made, since the last

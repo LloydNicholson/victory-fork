@@ -49,7 +49,19 @@ pub(crate) fn listed(n: u64) -> bool {
     let after = n.wrapping_sub(first);
     named
         || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
-        || trigger().is_some_and(|(path, t)| t.listed(n, path))
+        || TRIGGER.listed(n, trigger())
+}
+
+/// The frames a trigger file or the live marker (F12, `crate::live`) asked for.
+static TRIGGER: Trigger = Trigger::new();
+
+/// The live marker: the next two frames saved like a trigger file's. Says
+/// which, or `None` without a capture folder.
+pub(crate) fn request() -> Option<String> {
+    let folder = folder()?;
+    let from = crate::queue::presented() + 2;
+    TRIGGER.from.store(from, std::sync::atomic::Ordering::Relaxed);
+    Some(format!("frames {from} and {} in {}", from + 1, folder.display()))
 }
 
 /// `VICTORY_CAPTURE_TRIGGER=<file>`: whenever the file appears, it is
@@ -57,12 +69,10 @@ pub(crate) fn listed(n: u64) -> bool {
 /// their targets under `VICTORY_DUMP_TARGETS`). For a sight that comes
 /// and goes as the player moves (a character's arms drawn purple), when
 /// frame numbers cannot be known ahead.
-fn trigger() -> Option<(&'static std::path::Path, &'static Trigger)> {
+fn trigger() -> Option<&'static std::path::Path> {
     static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    static TRIGGER: Trigger = Trigger::new();
     PATH.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_TRIGGER").map(PathBuf::from))
         .as_deref()
-        .map(|p| (p, &TRIGGER))
 }
 
 /// The frames a [`trigger`] file asked for.
@@ -83,9 +93,12 @@ impl Trigger {
 
     /// Whether frame `n` is one the file asked for; looks for the file the
     /// first time it is asked about a frame.
-    fn listed(&self, n: u64, path: &std::path::Path) -> bool {
+    fn listed(&self, n: u64, path: Option<&std::path::Path>) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.looked.swap(n, Relaxed) != n && std::fs::remove_file(path).is_ok() {
+        if let Some(path) = path
+            && self.looked.swap(n, Relaxed) != n
+            && std::fs::remove_file(path).is_ok()
+        {
             self.from.store(n + 1, Relaxed);
             tracing::info!(frames = ?[n + 1, n + 2], "capture trigger: saving the next two frames");
         }
@@ -892,20 +905,30 @@ mod tests {
     fn a_trigger_file_saves_the_next_two_frames() {
         let path = std::env::temp_dir().join(format!("victory-trigger-{}", std::process::id()));
         let t = super::Trigger::new();
-        assert!(!t.listed(10, &path));
+        let t = Probe(&t, &path);
+        assert!(!t.listed_at(10, &path));
         std::fs::write(&path, b"").unwrap();
         // Looked for once a frame: not again at frame 10.
-        assert!(!t.listed(10, &path));
+        assert!(!t.listed_at(10, &path));
         assert!(path.exists());
         // Found at frame 11: frames 12 and 13 are asked for.
-        assert!(!t.listed(11, &path));
+        assert!(!t.listed_at(11, &path));
         assert!(!path.exists());
-        assert!(t.listed(12, &path) && t.listed(13, &path));
-        assert!(!t.listed(14, &path));
+        assert!(t.listed_at(12, &path) && t.listed_at(13, &path));
+        assert!(!t.listed_at(14, &path));
         // Again.
         std::fs::write(&path, b"").unwrap();
-        assert!(!t.listed(20, &path));
-        assert!(t.listed(21, &path) && t.listed(22, &path) && !t.listed(23, &path));
+        assert!(!t.listed_at(20, &path));
+        assert!(t.listed_at(21, &path) && t.listed_at(22, &path) && !t.listed_at(23, &path));
+    }
+
+    /// The trigger asked about one file.
+    struct Probe<'a>(&'a super::Trigger, &'a std::path::Path);
+
+    impl Probe<'_> {
+        fn listed_at(&self, n: u64, _: &std::path::Path) -> bool {
+            self.0.listed(n, Some(self.1))
+        }
     }
 
     #[test]
