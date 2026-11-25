@@ -536,6 +536,13 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Committed blocks that cannot be made read-only (a block only partly
+    /// committed, say), by the submission that found it ([`SUBMISSION`]):
+    /// reported written at every refresh, as before, but left out of the
+    /// runs that are guarded, which otherwise failed whole and were guarded
+    /// again block by block, with a `VirtualQuery` for this one, at every
+    /// refresh of every copy over it. Tried again in the next submission.
+    unguardable: std::collections::BTreeMap<usize, u64>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -543,7 +550,17 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    unguardable: std::collections::BTreeMap::new(),
 });
+
+impl Guards {
+    /// Whether `block` was found unguardable in this submission.
+    fn unguardable(&self, block: usize) -> bool {
+        self.unguardable
+            .get(&block)
+            .is_some_and(|&at| at == SUBMISSION.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -564,7 +581,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
+        g.protected.contains(&first) || g.absent.contains(&first) || g.unguardable.contains_key(&first)
     };
     if !known && !is_view(start, end) {
         return None;
@@ -608,10 +625,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !g.unguardable(block) {
                 run.get_or_insert(block);
                 continue;
             }
+            // (One that cannot be guarded ends the run, written.)
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block);
@@ -761,8 +779,15 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
+            g.unguardable.remove(&block);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
+        } else {
+            let now = SUBMISSION.load(std::sync::atomic::Ordering::Relaxed);
+            if g.unguardable.insert(block, now).is_none() {
+                #[cfg(feature = "diagnostics")]
+                UNCOMMITTED_ASKED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }
@@ -783,8 +808,9 @@ static UNCOMMITTED: Mutex<std::collections::BTreeMap<usize, (usize, u64)>> =
 /// `VirtualQuery` calls of [`uncommitted_end`] since the last frame line,
 /// their microseconds, and the answers taken from [`UNCOMMITTED`] instead.
 #[cfg(feature = "diagnostics")]
-pub(crate) static UNCOMMITTED_ASKED: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// And blocks newly found [`Guards::unguardable`].
+pub(crate) static UNCOMMITTED_ASKED: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Whether a region found uncommitted stays so for the rest of the
 /// submission (`VICTORY_ABSENT_ONCE=0`: asked every time, as before).
@@ -1069,6 +1095,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
+    let unguardable: Vec<usize> = g.unguardable.range(range.clone()).map(|(&b, _)| b).collect();
+    for block in unguardable {
+        g.unguardable.remove(&block);
+    }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
@@ -1310,6 +1340,59 @@ mod tests {
         // (within one, the answer that the block is uncommitted is kept).
         new_submission();
         assert_eq!(refresh(), [early / PAGE, late / PAGE]);
+    }
+
+    /// A block only partly committed cannot be made read-only: it is
+    /// reported written at every refresh, noted unguardable for the rest of
+    /// the submission (the runs beside it are guarded whole), and tried
+    /// again in the next submission.
+    #[test]
+    fn a_partly_committed_block_is_reported_written_and_tried_once_a_submission() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, SEC_RESERVE, UnmapViewOfFile,
+        };
+        const SIZE: usize = 3 * BLOCK;
+        // SAFETY: a new reserved pagefile section and a view of it.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view
+        };
+        let start = view.Value as usize;
+        // Blocks 0 and 2 whole, block 1 in part.
+        for (at, len) in [(start, BLOCK), (start + BLOCK, KERNEL_PAGE), (start + 2 * BLOCK, BLOCK)] {
+            // SAFETY: pages of our reserved view.
+            assert_eq!(unsafe { VirtualAlloc(at as _, len, MEM_COMMIT, PAGE_READWRITE) } as usize, at);
+        }
+        let middle = start / BLOCK + 1;
+        new_submission();
+        let all: Vec<usize> = (start / PAGE..(start + SIZE) / PAGE).collect();
+        assert_eq!(guard(start, start + SIZE).unwrap(), all);
+        assert!(guards().unguardable(middle));
+        // The whole blocks are guarded and clean; the partial one is written
+        // again, alone.
+        let middle_pages: Vec<usize> = (middle * BLOCK / PAGE..(middle + 1) * BLOCK / PAGE).collect();
+        assert_eq!(guard(start, start + SIZE).unwrap(), middle_pages);
+        // The next submission tries it again (and finds it unguardable).
+        new_submission();
+        assert!(!guards().unguardable(middle));
+        assert_eq!(guard(start, start + SIZE).unwrap(), middle_pages);
+        assert!(guards().unguardable(middle));
+        title_memory_remapped(start, SIZE);
+        assert!(!guards().unguardable.contains_key(&middle));
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// Within one submission a region found uncommitted is not asked about
