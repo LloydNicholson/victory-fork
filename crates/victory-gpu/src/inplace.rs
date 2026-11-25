@@ -1209,6 +1209,79 @@ mod tests {
         assert!(probe.reserved_section_refused, "a reserved section is refused");
     }
 
+    /// The probe on the card (the default adapter): what this PC's driver
+    /// takes, line by line. Run by hand, with a card:
+    /// `cargo test -p victory-gpu card_probe -- --ignored --nocapture`.
+    /// (Under Proton there is no software adapter, and the probe above
+    /// returns early.)
+    #[test]
+    #[ignore = "needs a card; prints what its driver takes"]
+    fn card_probe_says_what_the_driver_takes() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: device creation on the default adapter.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.expect("a D3D12 device");
+        let device = device.expect("a device");
+        eprintln!("ID3D12Device13: {}", device.cast::<ID3D12Device13>().is_ok());
+        let probe = probe(&device, &|| None, 64);
+        for line in &probe.lines {
+            eprintln!("in place probe: {line}");
+        }
+        // The page pool's shape: a view of a section, its pages committed,
+        // opened by address (not by the section): does the driver take
+        // shared pages, and does the GPU see the same bytes the view shows?
+        for (name, reserve) in [("committed section", false), ("reserved section, view committed (the page pool)", true)] {
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile,
+            };
+            const BYTES: usize = 4 * K64;
+            // SAFETY: a section and a view of the test's own.
+            unsafe {
+                let section = CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    mem::PAGE_READWRITE | if reserve { SEC_RESERVE } else { SEC_COMMIT },
+                    0,
+                    BYTES as u32,
+                    std::ptr::null(),
+                );
+                let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BYTES);
+                CloseHandle(section);
+                let at = view.Value as usize;
+                if reserve {
+                    mem::VirtualAlloc(at as _, BYTES, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+                }
+                fill(at as *mut u8, BYTES, 9);
+                let line = match open(&device, From::Part(at, BYTES)) {
+                    Err(e) => format!("REFUSED {e}"),
+                    Ok(heap) => match place(&device, &heap, 0, BYTES as u64) {
+                        Err(e) => format!("opened, buffer refused {e}"),
+                        Ok(buffer) => {
+                            let mut rig = Rig::new(&device).unwrap();
+                            let got = rig.fetch(&buffer, 0, BYTES).unwrap();
+                            let reads = same(at as *const u8, &got);
+                            rig.store(&buffer, 64, &[0x5a; 64]).unwrap();
+                            let writes = same((at + 64) as *const u8, &[0x5a; 64]);
+                            format!("opened; the GPU reads the view's bytes {reads}, its write shows in the view {writes}")
+                        }
+                    },
+                };
+                eprintln!("in place probe: a view of a {name}, by address (OpenExistingHeapFromAddress1): {line}");
+                UnmapViewOfFile(view);
+            }
+        }
+        eprintln!(
+            "part reads {} writes {}; section reads {} writes {}; section outlives views {}; reserved section refused {}",
+            probe.part_reads,
+            probe.part_writes,
+            probe.section_reads,
+            probe.section_writes,
+            probe.section_outlives_views,
+            probe.reserved_section_refused
+        );
+    }
+
     /// Stage 1's own call on the software adapter: a title buffer that
     /// begins and ends off the 64 KiB lines is placed over its pages, the
     /// GPU reads the buffer's bytes at the offset the views use, and its
