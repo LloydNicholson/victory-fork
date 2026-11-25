@@ -451,11 +451,57 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
+                    Held::Run(mut lists, mut order) => {
+                        // Consecutive submissions of this queue that are
+                        // free to run behind it, with only signals and met
+                        // memory-value waits between, go with it as one host
+                        // submission (`VICTORY_SUBMIT_GROUP`): each range
+                        // refreshed and asked about once. Their signals are
+                        // set behind the whole group, later, never earlier.
+                        let mut signals: Vec<(usize, u64)> = Vec::new();
+                        let mut members = 1;
+                        if !all && crate::host::late() && crate::host::group_cap() > 1 {
+                            while members < crate::host::group_cap() {
+                                let mut k = 0;
+                                while k < held.len() {
+                                    match &held[k] {
+                                        Held::Signal(..) => k += 1,
+                                        Held::Value(wait) if value_met(wait) => k += 1,
+                                        _ => break,
+                                    }
+                                }
+                                let Some(Held::Run(next_lists, next_order)) = held.get(k) else {
+                                    break;
+                                };
+                                let joins = {
+                                    let group: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+                                    let next: Vec<&crate::host::HostList> =
+                                        next_order.iter().map(|&i| next_lists[i].host()).collect();
+                                    crate::host::may_join(&group, &next)
+                                };
+                                if !joins {
+                                    break;
+                                }
+                                for item in held.drain(..k) {
+                                    if let Held::Signal(fence, value) = item {
+                                        signals.push((fence, value));
+                                    }
+                                }
+                                let Held::Run(next_lists, next_order) = held.remove(0) else {
+                                    unreachable!("a run was found there")
+                                };
+                                let base = lists.len();
+                                lists.extend(next_lists);
+                                order.extend(next_order.into_iter().map(|i| i + base));
+                                members += 1;
+                            }
+                            crate::host::GROUPED[0].fetch_add(members as u64, Ordering::Relaxed);
+                            crate::host::GROUPED[1].fetch_add(1, Ordering::Relaxed);
+                        }
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
-                                "RUN held submission of {} lists (forced {all})",
+                                "RUN held submission of {} lists, {members} title submissions (forced {all})",
                                 order.len()
                             )
                         });
@@ -507,6 +553,12 @@ fn release_held_now(all: bool) {
                             // They have run: their host lists are used again.
                             if ran {
                                 crate::list::recycle(lists, &order);
+                            }
+                        }
+                        // The group's signals, behind it, in order.
+                        for (fence, value) in signals {
+                            if !crate::host::late_signal(fence, value) {
+                                crate::fence::set(fence as This, value);
                             }
                         }
                         if all {

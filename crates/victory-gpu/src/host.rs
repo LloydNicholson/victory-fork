@@ -2589,6 +2589,91 @@ const WHY_FENCE: usize = 10;
 /// copy, a fill of upload memory, a texture).
 static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 
+/// What a submission's CPU steps do with title memory, for grouping: the
+/// ranges its title copies, fills and textures read at preparation, the
+/// ranges its shaders may write ([`Step::GpuWrite`]), and whether it runs
+/// work that may write title memory ([`Step::Run`]).
+struct StepSummary {
+    reads: Vec<(usize, usize)>,
+    writes: Vec<(usize, usize)>,
+    runs_work: bool,
+}
+
+fn step_summary(runs: &[&HostList]) -> StepSummary {
+    let mut sum = StepSummary { reads: Vec::new(), writes: Vec::new(), runs_work: false };
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => sum.reads.push((src, src + len)),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    sum.reads.push((at, at + len));
+                }
+                &Step::GpuWrite(_, at, len) => sum.writes.push((at, at + len)),
+                Step::Run(_) => sum.runs_work = true,
+                _ => {}
+            }
+        }
+    }
+    sum
+}
+
+/// Whether submission `next` may be prepared and sent in one host
+/// submission with `group`, the submissions before it on its queue
+/// (`docs/design-async-submission.md`, section 3): nothing of `group` runs
+/// work on title memory, and no CPU step of `next` reads title memory a
+/// shader of `group` may write (its preparation would read the bytes from
+/// before those shaders run, where as a submission of its own it would wait
+/// for them, or merge them in). Within one submission the lists run in
+/// order on the card, as the title's own multi-list submissions do.
+pub(crate) fn may_join(group: &[&HostList], next: &[&HostList]) -> bool {
+    joins(&step_summary(group), &step_summary(next))
+}
+
+/// [`may_join`] on the summaries.
+fn joins(group: &StepSummary, next: &StepSummary) -> bool {
+    !group.runs_work && !next.reads.iter().any(|&(a, b)| group.writes.iter().any(|&(c, d)| a < d && c < b))
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::{StepSummary, joins};
+
+    fn sum(reads: &[(usize, usize)], writes: &[(usize, usize)], runs_work: bool) -> StepSummary {
+        StepSummary { reads: reads.to_vec(), writes: writes.to_vec(), runs_work }
+    }
+
+    /// A submission joins the group before it unless it reads what the
+    /// group's shaders may write, or the group runs work on title memory.
+    #[test]
+    fn a_submission_joins_unless_it_reads_what_the_group_writes() {
+        let group = sum(&[(0, 0x100)], &[(0x1000, 0x2000)], false);
+        assert!(joins(&group, &sum(&[(0x2000, 0x2100)], &[], false)), "beside the writes");
+        assert!(joins(&group, &sum(&[], &[(0x1000, 0x2000)], false)), "writes the same: the card orders them");
+        assert!(!joins(&group, &sum(&[(0x1f00, 0x2100)], &[], false)), "reads what the group writes");
+        assert!(!joins(&sum(&[], &[], true), &sum(&[], &[], false)), "work on title memory ends a group");
+    }
+}
+
+/// The most title submissions the submit path puts in one host submission
+/// (`VICTORY_SUBMIT_GROUP`, 1 by default: none grouped). With submissions
+/// sent ahead (`late`) only. fps-17 measured groups of about 4.5 that
+/// would refresh half the memory of the submissions apart.
+pub(crate) fn group_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = std::env::var("VICTORY_SUBMIT_GROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        if cap > 1 {
+            tracing::info!(cap, "consecutive title submissions of a queue are prepared and sent as one (VICTORY_SUBMIT_GROUP)");
+        }
+        cap
+    })
+}
+
+/// Title submissions sent, and host submissions they made, since the last
+/// frame line ([`group_cap`]).
+pub(crate) static GROUPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Phase 1 of `docs/design-async-submission.md` (diagnostics): how title
 /// submissions would group, were consecutive ones on a queue prepared as
 /// one host submission. Nothing is grouped; each submission is looked at
@@ -7764,6 +7849,16 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        if group_cap() > 1 {
+            let [titles, hosts] = [0, 1].map(|i| GROUPED[i].swap(0, Ordering::Relaxed) as f64);
+            tracing::info!(
+                "submissions grouped (VICTORY_SUBMIT_GROUP={}): {:.1} title submissions a frame in {:.1} host submissions ({:.1} each)",
+                group_cap(),
+                titles / frames,
+                hosts / frames,
+                if hosts > 0.0 { titles / hosts } else { 0.0 }
+            );
+        }
         #[cfg(feature = "diagnostics")]
         tracing::info!("{}", group_line(frames));
         card_clock_line(frames, ms);
