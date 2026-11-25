@@ -47,7 +47,51 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+        || trigger().is_some_and(|(path, t)| t.listed(n, path))
+}
+
+/// `VICTORY_CAPTURE_TRIGGER=<file>`: whenever the file appears, it is
+/// removed and the next two whole frames are saved like listed ones (with
+/// their targets under `VICTORY_DUMP_TARGETS`). For a sight that comes
+/// and goes as the player moves (a character's arms drawn purple), when
+/// frame numbers cannot be known ahead.
+fn trigger() -> Option<(&'static std::path::Path, &'static Trigger)> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    static TRIGGER: Trigger = Trigger::new();
+    PATH.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_TRIGGER").map(PathBuf::from))
+        .as_deref()
+        .map(|p| (p, &TRIGGER))
+}
+
+/// The frames a [`trigger`] file asked for.
+struct Trigger {
+    /// The last frame number the file was looked for at (once a frame).
+    looked: std::sync::atomic::AtomicU64,
+    /// The first of the two frames asked for (`u64::MAX`: none).
+    from: std::sync::atomic::AtomicU64,
+}
+
+impl Trigger {
+    const fn new() -> Self {
+        Self {
+            looked: std::sync::atomic::AtomicU64::new(u64::MAX),
+            from: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// Whether frame `n` is one the file asked for; looks for the file the
+    /// first time it is asked about a frame.
+    fn listed(&self, n: u64, path: &std::path::Path) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.looked.swap(n, Relaxed) != n && std::fs::remove_file(path).is_ok() {
+            self.from.store(n + 1, Relaxed);
+            tracing::info!(frames = ?[n + 1, n + 2], "capture trigger: saving the next two frames");
+        }
+        let from = self.from.load(Relaxed);
+        from != u64::MAX && (n == from || n == from + 1)
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -826,6 +870,28 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// The trigger file asks for the two frames after the one it was
+    /// found at, once; it is gone after, and comes back for more.
+    #[test]
+    fn a_trigger_file_saves_the_next_two_frames() {
+        let path = std::env::temp_dir().join(format!("victory-trigger-{}", std::process::id()));
+        let t = super::Trigger::new();
+        assert!(!t.listed(10, &path));
+        std::fs::write(&path, b"").unwrap();
+        // Looked for once a frame: not again at frame 10.
+        assert!(!t.listed(10, &path));
+        assert!(path.exists());
+        // Found at frame 11: frames 12 and 13 are asked for.
+        assert!(!t.listed(11, &path));
+        assert!(!path.exists());
+        assert!(t.listed(12, &path) && t.listed(13, &path));
+        assert!(!t.listed(14, &path));
+        // Again.
+        std::fs::write(&path, b"").unwrap();
+        assert!(!t.listed(20, &path));
+        assert!(t.listed(21, &path) && t.listed(22, &path) && !t.listed(23, &path));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
