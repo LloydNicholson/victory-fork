@@ -487,6 +487,38 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// Where a constant view of a descriptor table can read the copy of the
+/// title buffer it names: the copy's GPU address of `address`, brought up to
+/// date by the list as root views are ([`root_view`]), when it starts on 256
+/// bytes (a constant buffer view's alignment) and the copy holds the view's
+/// bytes rounded up to 256; else `None`, and the view is filled into upload
+/// memory as before.
+///
+/// Why: a fill copies the title's bytes on the CPU when the submission is
+/// prepared, so where a flight's shaders write those bytes (the title's
+/// compute passes write constants that later draws read) the submission
+/// waited for that flight to land: fps-21 settled twice a frame for such
+/// fills, part of 47 ms a frame of the submit thread standing. Read from the
+/// copy, the bytes come in queue order on the card. `VICTORY_TABLE_CBV_FILL=1`
+/// fills them all, as before.
+fn constant_in_copy(list: &HostList, address: u64, size: u32) -> Option<u64> {
+    static FILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FILL.get_or_init(|| std::env::var_os("VICTORY_TABLE_CBV_FILL").is_some_and(|v| v == "1")) {
+        return None;
+    }
+    let rounded = u64::from(size).next_multiple_of(256);
+    let shadow = crate::shadow::find(address, 1)?;
+    if shadow.left(address) < rounded {
+        return None;
+    }
+    let gpu = shadow.gpu(address);
+    if !gpu.is_multiple_of(256) {
+        return None;
+    }
+    shadow.refresh(list, address, rounded);
+    Some(gpu)
+}
+
 /// Bytes of the zero-filled buffer bound where a root constant buffer or
 /// shader resource view has nothing to point at ([`null_root_view`]): the
 /// largest constant buffer.
@@ -2780,6 +2812,13 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // The copy of the title's buffer itself, where it can
+                        // be read as a constant buffer: in queue order behind
+                        // what shaders write there, with no fill to wait for.
+                        if let Some(gpu) = constant_in_copy(list, address, size) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -3683,5 +3722,42 @@ mod null_root_tests {
         note_null_root("test", 3, Some(0x1234));
         note_null_root("test", 3, None);
         assert_eq!(NULL_ROOTS.load(Ordering::Relaxed), before + 2);
+    }
+}
+
+#[cfg(test)]
+mod table_constant_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    /// A constant view of a table reads the copy of the title's buffer
+    /// itself where the copy starts it on 256 bytes and holds its rounded
+    /// size; elsewhere (off the alignment, past the copy's end) it is
+    /// filled into upload memory as before.
+    #[test]
+    fn a_table_constant_view_reads_the_copy_where_it_can() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("table_constant_tests: skipped, no host device");
+            return;
+        };
+        const LEN: usize = 1 << 20;
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(title, 0);
+        crate::shadow::register(0x7ab1_e0c8, title, LEN as u64);
+        let shadow = crate::shadow::find(title, LEN as u64).expect("a host copy");
+        let list = host.new_list().expect("a host list");
+        // An address the copy starts on 256 bytes.
+        let at = (0..LEN as u64).step_by(16).map(|o| title + o).find(|&a| shadow.gpu(a).is_multiple_of(256)).expect("an aligned address");
+        assert_eq!(constant_in_copy(&list, at, 200), Some(shadow.gpu(at)));
+        // Off the alignment: filled.
+        assert_eq!(constant_in_copy(&list, at + 16, 200), None);
+        // Its rounded size past the copy's end: filled.
+        let end = title + LEN as u64;
+        let near_end = (end - 4096..end).step_by(16).find(|&a| shadow.gpu(a).is_multiple_of(256)).expect("an aligned address near the end");
+        assert_eq!(constant_in_copy(&list, near_end, (end - near_end) as u32 + 1), None);
+        list.close();
+        // SAFETY: our allocation, released whole.
+        unsafe { VirtualFree(title as _, 0, MEM_RELEASE) };
     }
 }
