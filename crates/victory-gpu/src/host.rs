@@ -2481,6 +2481,209 @@ const WHY_FENCE: usize = 10;
 /// copy, a fill of upload memory, a texture).
 static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 
+/// Phase 1 of `docs/design-async-submission.md` (diagnostics): how title
+/// submissions would group, were consecutive ones on a queue prepared as
+/// one host submission. Nothing is grouped; each submission is looked at
+/// as it is made ([`group_probe`]) and the frame line says how many groups
+/// they would have made and the refreshing it would have saved.
+#[cfg(feature = "diagnostics")]
+mod group_sim {
+    use super::{HostList, Step};
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A group being built on one queue.
+    #[derive(Default)]
+    struct Group {
+        members: u32,
+        /// Title memory the members' shaders may write.
+        written: Vec<(usize, usize)>,
+        /// Title pages the members refresh, each once.
+        refreshed: BTreeSet<usize>,
+        /// A member runs work that may write title memory: nothing joins.
+        closed: bool,
+    }
+
+    static GROUPS: Mutex<Option<HashMap<usize, Group>>> = Mutex::new(None);
+
+    /// Since the last frame line: submissions, groups ended, refreshed
+    /// pages counted per submission, the same per group, and the groups
+    /// ended by each cause (a read of what a member writes, a member's
+    /// work on title memory, the cap, a signal or wait or present).
+    pub(super) static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    const SUBMISSIONS: usize = 0;
+    const ENDED: usize = 1;
+    const PAGES_ALONE: usize = 2;
+    const PAGES_GROUPED: usize = 3;
+    const BY_READ: usize = 4;
+    const BY_RUN: usize = 5;
+    const BY_CAP: usize = 6;
+    const BY_QUEUE: usize = 7;
+
+    /// The most submissions a group takes (`VICTORY_GROUP_SIM_CAP`, 8).
+    fn cap() -> u32 {
+        static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("VICTORY_GROUP_SIM_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1)
+        })
+    }
+
+    fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+        ranges.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    fn end(group: Group, why: usize) {
+        if group.members == 0 {
+            return;
+        }
+        STATS[ENDED].fetch_add(1, Ordering::Relaxed);
+        STATS[PAGES_GROUPED].fetch_add(group.refreshed.len() as u64, Ordering::Relaxed);
+        STATS[why].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The submission `runs` is made on queue `queue`; `waits`: one of its
+    /// lists waits for a memory value (it starts a group of its own).
+    pub(crate) fn probe(queue: usize, runs: &[&HostList], waits: bool) {
+        let page = crate::watch::PAGE;
+        let mut reads: Vec<(usize, usize)> = Vec::new();
+        let mut written: Vec<(usize, usize)> = Vec::new();
+        let mut refreshed: BTreeSet<usize> = BTreeSet::new();
+        let mut runs_work = false;
+        for list in runs {
+            for step in &list.deferred().copies {
+                match step {
+                    &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => reads.push((src, src + len)),
+                    Step::Texture(staging) => {
+                        let (at, len) = staging.memory();
+                        reads.push((at, at + len));
+                    }
+                    &Step::Refresh(_, at, len) => refreshed.extend(at / page..(at + len).div_ceil(page)),
+                    &Step::GpuWrite(_, at, len) => written.push((at, at + len)),
+                    Step::Run(_) => runs_work = true,
+                    _ => {}
+                }
+            }
+        }
+        join(queue, &reads, written, refreshed, runs_work, waits);
+    }
+
+    /// [`probe`] once the submission's steps are read: `reads` (title memory
+    /// its CPU steps read), `written` (what its shaders may write),
+    /// `refreshed` (its refreshed pages); whether it runs work on title
+    /// memory, whether it waits for a memory value.
+    fn join(queue: usize, reads: &[(usize, usize)], written: Vec<(usize, usize)>, refreshed: BTreeSet<usize>, runs_work: bool, waits: bool) {
+        STATS[SUBMISSIONS].fetch_add(1, Ordering::Relaxed);
+        STATS[PAGES_ALONE].fetch_add(refreshed.len() as u64, Ordering::Relaxed);
+        let mut all = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+        let groups = all.get_or_insert_with(HashMap::new);
+        let group = groups.entry(queue).or_default();
+        let why = if group.members == 0 {
+            None
+        } else if waits {
+            Some(BY_QUEUE)
+        } else if group.closed {
+            Some(BY_RUN)
+        } else if reads.iter().any(|&(a, b)| touches(&group.written, a, b)) {
+            Some(BY_READ)
+        } else if group.members >= cap() {
+            Some(BY_CAP)
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            end(std::mem::take(group), why);
+        }
+        group.members += 1;
+        group.written.extend(written);
+        group.refreshed.extend(refreshed);
+        group.closed |= runs_work;
+    }
+
+    /// A signal or a wait on `queue` (`None`: a present, every queue): the
+    /// groups there end.
+    pub(crate) fn cut(queue: Option<usize>) {
+        let mut all = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(groups) = all.as_mut() else { return };
+        let ended: Vec<Group> = match queue {
+            Some(q) => groups.remove(&q).into_iter().collect(),
+            None => groups.drain().map(|(_, g)| g).collect(),
+        };
+        drop(all);
+        for g in ended {
+            end(g, BY_QUEUE);
+        }
+    }
+
+    /// The groups' members on `queue` now (tests).
+    #[cfg(test)]
+    fn members(queue: usize) -> u32 {
+        GROUPS.lock().unwrap().as_ref().and_then(|g| g.get(&queue)).map_or(0, |g| g.members)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Submissions join while they read nothing a member writes; a read
+        /// of it, work on title memory, a signal and the cap each end the
+        /// group. Pages refreshed by several members count once per group.
+        #[test]
+        fn submissions_group_until_a_read_of_what_a_member_writes() {
+            // A queue address of the test's own (the groups are the process's).
+            let q = 0x7e57_0001;
+            let pages = |r: std::ops::Range<usize>| r.collect::<BTreeSet<usize>>();
+            join(q, &[], vec![(0x1000_0000, 0x1001_0000)], pages(1..4), false, false);
+            join(q, &[(0x2000_0000, 0x2000_0100)], vec![], pages(2..6), false, false);
+            assert_eq!(members(q), 2);
+            // Reads what the first writes: a new group.
+            join(q, &[(0x1000_8000, 0x1000_8100)], vec![], pages(1..2), false, false);
+            assert_eq!(members(q), 1);
+            // Work on title memory closes the group behind it.
+            join(q, &[], vec![], BTreeSet::new(), true, false);
+            assert_eq!(members(q), 2);
+            join(q, &[], vec![], BTreeSet::new(), false, false);
+            assert_eq!(members(q), 1);
+            // A signal ends it; a submission that waits starts its own.
+            cut(Some(q));
+            assert_eq!(members(q), 0);
+            join(q, &[], vec![], BTreeSet::new(), false, false);
+            join(q, &[], vec![], BTreeSet::new(), false, true);
+            assert_eq!(members(q), 1);
+            // The cap.
+            for _ in 0..cap() {
+                join(q, &[], vec![], BTreeSet::new(), false, false);
+            }
+            assert_eq!(members(q), 1);
+            cut(Some(q));
+        }
+    }
+
+    /// The frame line's text.
+    pub(crate) fn line(frames: f64) -> String {
+        let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64).collect();
+        let mb = |pages: f64| pages * crate::watch::PAGE as f64 / 1e6 / frames;
+        format!(
+            "grouping, simulated (cap {}): {:.1} submissions a frame in {:.1} groups ended ({:.1} each); \
+             refreshed {:.1} MB a frame counted per submission, {:.1} MB per group; groups ended by a read \
+             of what a member writes {:.1}, a member's work on title memory {:.1}, the cap {:.1}, a signal, \
+             wait or present {:.1}",
+            cap(),
+            s[SUBMISSIONS] / frames,
+            s[ENDED] / frames,
+            if s[ENDED] > 0.0 { s[SUBMISSIONS] / s[ENDED] } else { 0.0 },
+            mb(s[PAGES_ALONE]),
+            mb(s[PAGES_GROUPED]),
+            s[BY_READ] / frames,
+            s[BY_RUN] / frames,
+            s[BY_CAP] / frames,
+            s[BY_QUEUE] / frames,
+        )
+    }
+}
+#[cfg(feature = "diagnostics")]
+pub(crate) use group_sim::{cut as group_cut, line as group_line, probe as group_probe};
+
 /// What a fill of upload memory is for ([`Step::Fill`]): a root constant
 /// view whose copy is not 256-byte aligned, a constant view in a
 /// descriptor table, a texture copied from a buffer.
@@ -6673,6 +6876,8 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        #[cfg(feature = "diagnostics")]
+        tracing::info!("{}", group_line(frames));
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {

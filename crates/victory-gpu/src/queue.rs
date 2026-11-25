@@ -521,6 +521,14 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // Diagnostics: how this submission would group with the queue's
+        // last ones (`docs/design-async-submission.md`, phase 1).
+        #[cfg(feature = "diagnostics")]
+        if !this.is_null() {
+            let runs: Vec<&crate::host::HostList> = lists.iter().filter_map(|&l| crate::list::host_list(l)).collect();
+            let waits = lists.iter().any(|&l| crate::list::cut_list(l));
+            crate::host::group_probe(this as usize, &runs, waits);
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -614,6 +622,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::host::group_cut(Some(this as usize));
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -639,6 +649,8 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::host::group_cut(Some(this as usize));
     #[cfg(windows)]
     if !this.is_null() {
         let now = crate::fence::completed(fence);
@@ -762,6 +774,8 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::host::group_cut(None);
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
