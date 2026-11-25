@@ -289,6 +289,32 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+    let whole = v.sections.iter().all(|s| s.2);
+    SECTIONS_COMMITTED.store(whole, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every section the runtime made for physical pages is committed whole
+/// (under Wine, `xmem` makes them so): a view's pages are committed from
+/// the moment it is mapped, and view memory turns from uncommitted to
+/// committed only when the runtime maps a view there, which it tells
+/// ([`crate::title_memory_remapped`]). With sections made reserved (Windows)
+/// a page committed through one view is committed at its other views too,
+/// and nothing says so.
+static SECTIONS_COMMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`SECTIONS_COMMITTED`].
+pub(crate) fn sections_committed() -> bool {
+    #[cfg(test)]
+    if let Some(whole) = TEST_SECTIONS_COMMITTED.get() {
+        return whole;
+    }
+    SECTIONS_COMMITTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own answer for [`sections_committed`] (tests run side by side).
+    pub(crate) static TEST_SECTIONS_COMMITTED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from

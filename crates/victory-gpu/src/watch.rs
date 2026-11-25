@@ -801,8 +801,9 @@ fn new_submission() {
 }
 
 /// Regions [`uncommitted_end`] found uncommitted, by first block: (end,
-/// the submission that asked).
-static UNCOMMITTED: Mutex<std::collections::BTreeMap<usize, (usize, u64)>> =
+/// the submission that asked, whether the answer stands until a remap
+/// rather than for that submission alone).
+static UNCOMMITTED: Mutex<std::collections::BTreeMap<usize, (usize, u64, bool)>> =
     Mutex::new(std::collections::BTreeMap::new());
 
 /// `VirtualQuery` calls of [`uncommitted_end`] since the last frame line,
@@ -813,7 +814,11 @@ pub(crate) static UNCOMMITTED_ASKED: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Whether a region found uncommitted stays so for the rest of the
-/// submission (`VICTORY_ABSENT_ONCE=0`: asked every time, as before).
+/// submission, or until the runtime maps memory there when every section
+/// of physical pages is committed whole (under Wine:
+/// [`crate::inplace::sections_committed`]); `VICTORY_ABSENT_ONCE=0`: asked
+/// every time, as before. In fps-11 a frame asked 4,000-6,000 times, about
+/// 150 regions once in each of ~30 submissions.
 ///
 /// The guards ask the kernel, block by block, whether the uncommitted blocks
 /// of a copy they refresh are committed yet: under Proton `VirtualQuery`
@@ -835,8 +840,8 @@ fn uncommitted_end(block: usize) -> usize {
     let now = SUBMISSION.load(Relaxed);
     if absent_once() {
         let known = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, &(end, asked))) = known.range(..=block).next_back()
-            && asked == now
+        if let Some((_, &(end, asked, until_remap))) = known.range(..=block).next_back()
+            && (asked == now || until_remap)
             && block < end
         {
             #[cfg(feature = "diagnostics")]
@@ -854,8 +859,10 @@ fn uncommitted_end(block: usize) -> usize {
     }
     if absent_once() && end > block {
         let mut known = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
-        known.retain(|_, &mut (_, asked)| asked == now);
-        known.insert(block, (end, now));
+        // With sections committed whole the answer stands until a remap,
+        // whatever the submission; others go with their submission.
+        known.retain(|_, &mut (_, asked, until_remap)| until_remap || asked == now);
+        known.insert(block, (end, now, crate::inplace::sections_committed()));
     }
     end
 }
@@ -1080,8 +1087,12 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
-    // What was found uncommitted may be committed now.
-    UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // What was found uncommitted there may be committed now.
+    {
+        let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+        let mut known = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        known.retain(|&start, &mut (end, _, _)| end <= first || start >= last);
+    }
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1283,6 +1294,7 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        let _one = SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -1342,12 +1354,41 @@ mod tests {
         assert_eq!(refresh(), [early / PAGE, late / PAGE]);
     }
 
+    /// With every section committed whole (Wine) a region found
+    /// uncommitted stays so across submissions, until a remap.
+    #[test]
+    fn with_sections_committed_whole_an_uncommitted_region_stands_until_a_remap() {
+        let _one = SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        crate::inplace::TEST_SECTIONS_COMMITTED.set(Some(true));
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(reserved, 0);
+        let first = reserved.div_ceil(BLOCK);
+        new_submission();
+        let end = uncommitted_end(first);
+        assert!(end > first);
+        // SAFETY: our reservation.
+        unsafe { VirtualAlloc((first * BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+        if absent_once() {
+            // Submissions later, still the answer kept.
+            new_submission();
+            new_submission();
+            assert_eq!(uncommitted_end(first), end);
+        }
+        // The runtime maps there: asked again.
+        title_memory_remapped(first * BLOCK, BLOCK);
+        assert_eq!(uncommitted_end(first), first);
+        crate::inplace::TEST_SECTIONS_COMMITTED.set(None);
+        // SAFETY: our reservation, released whole.
+        unsafe { VirtualFree(reserved as _, 0, MEM_RELEASE) };
+    }
+
     /// A block only partly committed cannot be made read-only: it is
     /// reported written at every refresh, noted unguardable for the rest of
     /// the submission (the runs beside it are guarded whole), and tried
     /// again in the next submission.
     #[test]
     fn a_partly_committed_block_is_reported_written_and_tried_once_a_submission() {
+        let _one = SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, SEC_RESERVE, UnmapViewOfFile,
@@ -1395,10 +1436,15 @@ mod tests {
         unsafe { UnmapViewOfFile(view) };
     }
 
+    /// The tests that begin submissions, one at a time (the count is the
+    /// process's).
+    static SUBMISSIONS: Mutex<()> = Mutex::new(());
+
     /// Within one submission a region found uncommitted is not asked about
     /// again; the next submission asks, and so does a runtime remap.
     #[test]
     fn an_uncommitted_region_is_asked_about_once_a_submission() {
+        let _one = SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner());
         let reserved = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
         assert_ne!(reserved, 0);
         let first = reserved.div_ceil(BLOCK);
