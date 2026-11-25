@@ -184,7 +184,8 @@ static WAITING: AtomicU64 = AtomicU64::new(0);
 
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
-    WAITING.load(Ordering::Relaxed)
+    // Not the stuck ones: they are not being made any more.
+    WAITING.load(Ordering::Relaxed).saturating_sub(STUCK.load(Ordering::Relaxed))
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);

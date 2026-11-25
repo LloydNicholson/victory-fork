@@ -6829,11 +6829,13 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
-        text.push(0);
+        let text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
-        // presenting never waits; it takes the newest text when free.
+        // presenting never waits; it takes the newest text when free. It
+        // also adds the pipelines being compiled, looked at four times a
+        // second: a loading frame can take seconds, and that is when most
+        // are compiled.
         static PENDING: Mutex<Option<(usize, Vec<u16>)>> = Mutex::new(None);
         static SETTER: std::sync::Once = std::sync::Once::new();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
@@ -6841,15 +6843,29 @@ impl Meter {
             let _ = std::thread::Builder::new()
                 .name("victory-caption".into())
                 .spawn(|| {
+                    let mut shown: Option<(usize, Vec<u16>)> = None;
+                    let mut compiling_shown = u64::MAX;
                     loop {
                         let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        match next {
-                            // SAFETY: a window handle and a NUL-terminated text.
-                            Some((hwnd, text)) => unsafe {
-                                let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
-                            },
-                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                        let compiling = crate::pipeline::making();
+                        if next.is_some() || compiling != compiling_shown {
+                            if let Some(next) = next {
+                                shown = Some(next);
+                            }
+                            if let Some((hwnd, base)) = &shown {
+                                let mut text = base.clone();
+                                if compiling > 0 {
+                                    text.extend(format!(", {compiling} pipelines compiling").encode_utf16());
+                                }
+                                text.push(0);
+                                // SAFETY: a window handle and a NUL-terminated text.
+                                unsafe {
+                                    let _ = SetWindowTextW(HWND(*hwnd as *mut _), PCWSTR(text.as_ptr()));
+                                }
+                                compiling_shown = compiling;
+                            }
                         }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
                     }
                 });
         });
